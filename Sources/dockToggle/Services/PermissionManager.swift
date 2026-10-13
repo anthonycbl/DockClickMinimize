@@ -33,6 +33,10 @@ final class PermissionManager {
         NSWorkspace.shared.open(url)
     }
 
+    func requestInputMonitoringPrompt() {
+        _ = CGRequestListenEventAccess()
+    }
+
     func openInputMonitoringSettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") else {
             return
@@ -40,24 +44,10 @@ final class PermissionManager {
         NSWorkspace.shared.open(url)
     }
 
+    // CGPreflightListenEventAccess is the official Input Monitoring check;
+    // probing by creating an event tap can report the wrong state when only
+    // Accessibility is granted.
     private func hasInputMonitoringPermission() -> Bool {
-        let mask = CGEventMask(1) << CGEventType.leftMouseDown.rawValue
-        let tap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .listenOnly,
-            eventsOfInterest: mask,
-            callback: { _, _, event, _ in
-                Unmanaged.passUnretained(event)
-            },
-            userInfo: nil
-        )
-
-        guard let tap else {
-            return false
-        }
-
-        CFMachPortInvalidate(tap)
-        return true
+        CGPreflightListenEventAccess()
     }
 }

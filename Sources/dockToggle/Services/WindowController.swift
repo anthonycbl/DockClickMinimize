@@ -10,13 +10,19 @@ private enum AXCustomAttribute {
 
 private struct RestoreLedger {
     let orderedWindowIDs: [Int]
+    let orderedWindowTitles: [String?]
     let lastActiveWindowID: Int?
+    let lastActiveWindowTitle: String?
     let createdAt: Date
 }
 
 private struct AXWindowInfo {
     let element: AXUIElement
     let windowID: Int
+    // False when the app doesn't expose AXWindowNumber: windowID is then a
+    // per-read element pointer that gets reused, so it can't identify a window.
+    let hasStableID: Bool
+    let title: String?
     let role: String?
     let subrole: String?
     let isMinimized: Bool?
@@ -24,16 +30,10 @@ private struct AXWindowInfo {
     let isFullScreen: Bool?
     let isMain: Bool?
     let isFocused: Bool?
-    let canSetMinimized: Bool?
-    let canRaise: Bool
 
     var isStandardWindow: Bool {
         let roleLooksWindowLike = role == nil || role == kAXWindowRole as String
         return roleLooksWindowLike && subrole != kAXSystemDialogSubrole as String
-    }
-
-    var isActionableForMinimize: Bool {
-        canSetMinimized != false
     }
 }
 
@@ -43,6 +43,7 @@ final class WindowController {
     private let isDebugLoggingEnabled = ProcessInfo.processInfo.environment["DOCKCLICK_DEBUG"] == "1"
 
     func handleFrontmostClick(app: NSRunningApplication, preferences: AppPreferences) async {
+        pruneLedgersForTerminatedApps()
         let pid = app.processIdentifier
         let windows = standardWindows(for: pid)
         debugLog("Frontmost click for \(app.bundleIdentifier ?? "?"), windows=\(windows.count)")
@@ -64,7 +65,7 @@ final class WindowController {
         }
 
         if shouldRestore(pid: pid, windows: windows, behavior: preferences.restoreBehavior) {
-            restoreWindows(pid: pid, windows: windows, behavior: preferences.restoreBehavior)
+            await restoreWindows(pid: pid, windows: windows, behavior: preferences.restoreBehavior)
             return
         }
 
@@ -85,7 +86,10 @@ final class WindowController {
         }
 
         let targets = minimizeTargets(from: windows, frontWindow: frontWindow, behavior: preferences.frontmostMinimizeBehavior)
-        let minimizedIDs = minimize(windows: targets)
+        var minimizedIDs = minimize(windows: targets)
+        for id in await retryIgnoredMinimizes(targets) where !minimizedIDs.contains(id) {
+            minimizedIDs.append(id)
+        }
         debugLog("Minimize targets=\(targets.count), minimized=\(minimizedIDs.count)")
 
         guard !minimizedIDs.isEmpty else {
@@ -94,16 +98,16 @@ final class WindowController {
 
         restoreLedgerByPID[pid] = RestoreLedger(
             orderedWindowIDs: minimizedIDs,
+            orderedWindowTitles: minimizedIDs.map { id in targets.first(where: { $0.windowID == id })?.title },
             lastActiveWindowID: frontWindow.windowID,
+            lastActiveWindowTitle: frontWindow.title,
             createdAt: Date()
         )
     }
 
     func minimizeImmediately(app: NSRunningApplication) -> Bool {
         let windows = standardWindows(for: app.processIdentifier)
-        let minimizableWindows = windows.filter { info in
-            info.isMinimized != true && info.isActionableForMinimize
-        }
+        let minimizableWindows = windows.filter { $0.isMinimized != true }
 
         let minimized = minimize(windows: minimizableWindows)
         var didHide = false
@@ -126,10 +130,15 @@ final class WindowController {
         return didSucceed
     }
 
+    private func pruneLedgersForTerminatedApps() {
+        restoreLedgerByPID = restoreLedgerByPID.filter { pid, _ in
+            NSRunningApplication(processIdentifier: pid)?.isTerminated == false
+        }
+    }
+
     private func shouldRestore(pid: pid_t, windows: [AXWindowInfo], behavior: RestoreBehavior) -> Bool {
-        let minimizable = windows.filter { $0.isActionableForMinimize }
-        let currentlyMinimized = minimizable.filter { $0.isMinimized == true }
-        let currentlyUnminimized = minimizable.filter { $0.isMinimized != true }
+        let currentlyMinimized = windows.filter { $0.isMinimized == true }
+        let currentlyUnminimized = windows.filter { $0.isMinimized != true }
         let ledgerMinimizationStates: [Bool] = {
             guard let ledger = restoreLedgerByPID[pid], !ledger.orderedWindowIDs.isEmpty else {
                 return []
@@ -147,8 +156,9 @@ final class WindowController {
         )
     }
 
-    private func restoreWindows(pid: pid_t, windows: [AXWindowInfo], behavior: RestoreBehavior) {
-        let minimizedNow = windows.filter { $0.isActionableForMinimize && $0.isMinimized == true }
+    private func restoreWindows(pid: pid_t, windows: [AXWindowInfo], behavior: RestoreBehavior) async {
+        let ledger = restoreLedgerByPID[pid]
+        let minimizedNow = windows.filter { $0.isMinimized == true }
         guard !minimizedNow.isEmpty else {
             restoreLedgerByPID[pid] = nil
             return
@@ -160,7 +170,7 @@ final class WindowController {
             // Always restore all currently minimized windows for restore-all mode.
             targets = minimizedNow
         case .restoreLastActiveWindow:
-            if let ledger = restoreLedgerByPID[pid] {
+            if let ledger {
                 let windowByID = Dictionary(uniqueKeysWithValues: windows.map { ($0.windowID, $0) })
                 let candidateIDs = RestorePlanner.windowsToRestore(
                     orderedWindowIDs: ledger.orderedWindowIDs,
@@ -184,16 +194,90 @@ final class WindowController {
             return
         }
 
-        for target in targets where target.isActionableForMinimize {
-            _ = setBoolAttribute(kAXMinimizedAttribute as String, value: false, on: target.element)
-        }
-        debugLog("Restore targets=\(targets.count)")
-
-        if let first = targets.first, first.canRaise {
-            _ = AXUIElementPerformAction(first.element, kAXRaiseAction as CFString)
+        // Identify the window that was active when we minimized.
+        let lastActive = ledger.flatMap { ledger in
+            targets.first(where: { matches($0, id: ledger.lastActiveWindowID, title: ledger.lastActiveWindowTitle) })
         }
 
         restoreLedgerByPID[pid] = nil
+
+        guard let lastActive else {
+            for target in targets {
+                _ = setBoolAttribute(kAXMinimizedAttribute as String, value: false, on: target.element)
+            }
+            debugLog("Restore targets=\(targets.count), no last-active match")
+            // Raising immediately gets ignored while the un-minimize animation
+            // is still running; wait for it to settle, then select the window.
+            if let raiseTarget = targets.last {
+                try? await Task.sleep(for: .milliseconds(250))
+                raise(raiseTarget)
+            }
+            return
+        }
+
+        guard behavior == .restoreAllMinimizedWindows else {
+            _ = setBoolAttribute(kAXMinimizedAttribute as String, value: false, on: lastActive.element)
+            debugLog("Restored last-active window only")
+            return
+        }
+
+        // Restore the other windows we minimized first and the last-active one
+        // last, so it ends up on top. Only windows in the ledger are touched: a
+        // minimized Finder window lists each of its tabs as a separate minimized
+        // AX window, and un-minimizing a background tab switches the selected
+        // tab. Background tabs never enter the ledger because an open Finder
+        // window only lists its selected tab.
+        var others: [AXWindowInfo] = []
+        if let ledger {
+            var pool = minimizedNow.filter { $0.element !== lastActive.element }
+            for (id, title) in zip(ledger.orderedWindowIDs, ledger.orderedWindowTitles) {
+                if let index = pool.firstIndex(where: { matches($0, id: id, title: title) }) {
+                    others.append(pool.remove(at: index))
+                }
+            }
+        }
+
+        for window in others {
+            _ = setBoolAttribute(kAXMinimizedAttribute as String, value: false, on: window.element)
+        }
+        // Apps like Word and Excel drop requests that arrive back-to-back, so
+        // give the others a moment before restoring the last-active window.
+        if !others.isEmpty {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        _ = setBoolAttribute(kAXMinimizedAttribute as String, value: false, on: lastActive.element)
+
+        // Anything still minimized was minimized by the user rather than by us;
+        // restore-all brings it back too. Wait until background Finder tabs are
+        // no longer listed (they disappear once their window is open). Nothing
+        // visible happens during this wait.
+        try? await Task.sleep(for: .milliseconds(250))
+        let stragglers = standardWindows(for: pid).filter { $0.isMinimized == true }
+        debugLog("Restored \(others.count) other windows, then last-active, then \(stragglers.count) stragglers")
+        guard !stragglers.isEmpty else {
+            return
+        }
+
+        for window in stragglers {
+            _ = setBoolAttribute(kAXMinimizedAttribute as String, value: false, on: window.element)
+        }
+        // Stragglers landed on top; put the last-active window back in front.
+        // Raising immediately gets ignored while the un-minimize animation is
+        // still running.
+        try? await Task.sleep(for: .milliseconds(250))
+        raise(lastActive)
+    }
+
+    private func matches(_ window: AXWindowInfo, id: Int?, title: String?) -> Bool {
+        if window.hasStableID {
+            return window.windowID == id
+        }
+        return title != nil && window.title == title
+    }
+
+    private func raise(_ window: AXWindowInfo) {
+        _ = AXUIElementPerformAction(window.element, kAXRaiseAction as CFString)
+        _ = setBoolAttribute(kAXMainAttribute as String, value: true, on: window.element)
     }
 
     private func fallbackRestoreTargets(from minimizedWindows: [AXWindowInfo], behavior: RestoreBehavior) -> [AXWindowInfo] {
@@ -206,9 +290,7 @@ final class WindowController {
     }
 
     private func minimizeTargets(from windows: [AXWindowInfo], frontWindow: AXWindowInfo, behavior: FrontmostMinimizeBehavior) -> [AXWindowInfo] {
-        let minimizable = windows.filter { info in
-            info.isMinimized != true && info.isActionableForMinimize
-        }
+        let minimizable = windows.filter { $0.isMinimized != true }
 
         switch behavior {
         case .minimizeAllWindows:
@@ -229,7 +311,9 @@ final class WindowController {
     private func minimize(windows: [AXWindowInfo]) -> [Int] {
         var minimized: [Int] = []
 
-        for window in windows where window.isActionableForMinimize {
+        // Attempting the set and checking the result replaces a separate
+        // "is this settable?" AX round-trip per window.
+        for window in windows {
             let didSet = setBoolAttribute(kAXMinimizedAttribute as String, value: true, on: window.element)
             if didSet {
                 minimized.append(window.windowID)
@@ -239,19 +323,35 @@ final class WindowController {
         return minimized
     }
 
+    // Some apps (e.g. Microsoft Excel and Word) accept every minimize request
+    // but act only on the first while its animation runs, silently dropping
+    // the rest. Re-check the real state and retry the stragglers.
+    private func retryIgnoredMinimizes(_ windows: [AXWindowInfo]) async -> [Int] {
+        var pending = windows
+        for _ in 0..<6 {
+            pending = pending.filter { boolAttribute(kAXMinimizedAttribute as String, from: $0.element) == false }
+            guard !pending.isEmpty else {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+            let retried = minimize(windows: pending)
+            debugLog("Retried minimize for \(pending.count) ignored windows, accepted=\(retried.count)")
+        }
+        return windows.filter { boolAttribute(kAXMinimizedAttribute as String, from: $0.element) == true }.map(\.windowID)
+    }
+
     private func handleBlockedModal(windows: [AXWindowInfo], mainWindow: AXWindowInfo?, behavior: ModalBlockingBehavior) {
         switch behavior {
         case .doNothing:
             return
         case .minimizeMainWindowBehindModal:
-            guard let mainWindow, mainWindow.isActionableForMinimize else {
+            guard let mainWindow else {
                 return
             }
             _ = setBoolAttribute(kAXMinimizedAttribute as String, value: true, on: mainWindow.element)
         case .minimizeModalIfPossible:
             guard let modal = windows.first(where: {
-                ($0.subrole == kAXDialogSubrole as String || $0.subrole == kAXSystemDialogSubrole as String) &&
-                $0.isActionableForMinimize
+                $0.subrole == kAXDialogSubrole as String || $0.subrole == kAXSystemDialogSubrole as String
             }) else {
                 return
             }
@@ -273,11 +373,13 @@ final class WindowController {
             return .uncertain
         }
 
-        guard let canSetMinimized = mainWindow.canSetMinimized else {
+        // Capability probes run only on this modal path, never on the common
+        // minimize/restore paths.
+        guard let canSetMinimized = isAttributeSettable(kAXMinimizedAttribute as String, on: mainWindow.element) else {
             return .uncertain
         }
 
-        if canSetMinimized || mainWindow.canRaise {
+        if canSetMinimized || actionSupported(kAXRaiseAction as String, on: mainWindow.element) {
             return .clear
         }
 
@@ -314,21 +416,48 @@ final class WindowController {
         return standard
     }
 
+    // Fetches all window attributes in a single AX round-trip instead of one
+    // IPC call per attribute. Unsupported attributes come back as non-matching
+    // placeholder values and read as nil.
+    private static let windowAttributeNames: [String] = [
+        AXCustomAttribute.windowNumber,
+        kAXTitleAttribute as String,
+        kAXRoleAttribute as String,
+        kAXSubroleAttribute as String,
+        kAXMinimizedAttribute as String,
+        AXCustomAttribute.visible,
+        AXCustomAttribute.fullScreen,
+        kAXMainAttribute as String,
+        kAXFocusedAttribute as String
+    ]
+
     private func buildWindowInfo(for element: AXUIElement) -> AXWindowInfo? {
-        let windowID = intAttribute(AXCustomAttribute.windowNumber, from: element) ?? fallbackWindowID(for: element)
+        var valuesRef: CFArray?
+        let result = AXUIElementCopyMultipleAttributeValues(
+            element,
+            Self.windowAttributeNames as CFArray,
+            AXCopyMultipleAttributeOptions(),
+            &valuesRef
+        )
+
+        guard result == .success,
+              let values = valuesRef as? [AnyObject],
+              values.count == Self.windowAttributeNames.count else {
+            return nil
+        }
 
         return AXWindowInfo(
             element: element,
-            windowID: windowID,
-            role: stringAttribute(kAXRoleAttribute as String, from: element),
-            subrole: stringAttribute(kAXSubroleAttribute as String, from: element),
-            isMinimized: boolAttribute(kAXMinimizedAttribute as String, from: element),
-            isVisible: boolAttribute(AXCustomAttribute.visible, from: element),
-            isFullScreen: boolAttribute(AXCustomAttribute.fullScreen, from: element),
-            isMain: boolAttribute(kAXMainAttribute as String, from: element),
-            isFocused: boolAttribute(kAXFocusedAttribute as String, from: element),
-            canSetMinimized: isAttributeSettable(kAXMinimizedAttribute as String, on: element),
-            canRaise: actionSupported(kAXRaiseAction as String, on: element)
+            windowID: (values[0] as? NSNumber)?.intValue ?? fallbackWindowID(for: element),
+            hasStableID: values[0] is NSNumber,
+            title: values[1] as? String,
+            role: values[2] as? String,
+            subrole: values[3] as? String,
+            isMinimized: values[4] as? Bool,
+            isVisible: values[5] as? Bool,
+            isFullScreen: values[6] as? Bool,
+            isMain: values[7] as? Bool,
+            isFocused: values[8] as? Bool
         )
     }
 
@@ -369,29 +498,6 @@ final class WindowController {
             return nil
         }
         return value as? Bool
-    }
-
-    private func stringAttribute(_ attribute: String, from element: AXUIElement) -> String? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
-        guard result == .success else {
-            return nil
-        }
-        return value as? String
-    }
-
-    private func intAttribute(_ attribute: String, from element: AXUIElement) -> Int? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
-        guard result == .success else {
-            return nil
-        }
-
-        if let number = value as? NSNumber {
-            return number.intValue
-        }
-
-        return nil
     }
 
     private func fallbackWindowID(for element: AXUIElement) -> Int {

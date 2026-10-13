@@ -26,11 +26,25 @@ final class DockEventResolver {
 
     private var lastResolvedPID: pid_t = -1
     private var lastResolvedAt: CFAbsoluteTime = 0
+    private var cachedDockPID: pid_t = -1
+
+    // Screen frames are cached and refreshed only when the display layout
+    // changes, keeping the per-click path free of AppKit queries.
+    private var cachedScreenFrames: [NSRect] = NSScreen.screens.map(\.frame)
+    private var screenChangeObserver: NSObjectProtocol?
     private let isDebugLoggingEnabled = ProcessInfo.processInfo.environment["DOCKCLICK_DEBUG"] == "1"
 
     init(confidenceThreshold: Double = 0.8, debounceInterval: CFAbsoluteTime = 0.18) {
         self.gate = DockResolutionConfidenceGate(threshold: confidenceThreshold)
         self.debounceInterval = debounceInterval
+
+        screenChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.cachedScreenFrames = NSScreen.screens.map(\.frame)
+        }
     }
 
     var isRunning: Bool {
@@ -90,6 +104,9 @@ final class DockEventResolver {
 
     deinit {
         stop()
+        if let screenChangeObserver {
+            NotificationCenter.default.removeObserver(screenChangeObserver)
+        }
     }
 
     private static let tapCallback: CGEventTapCallBack = { proxy, type, event, userInfo in
@@ -113,11 +130,18 @@ final class DockEventResolver {
             return Unmanaged.passUnretained(event)
         }
 
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier {
+        let point = event.location
+
+        // Cheap pre-filter: the Dock can only live along the bottom, left, or
+        // right screen edge. Skipping clicks elsewhere avoids expensive AX
+        // hit-testing on every click system-wide (battery/CPU).
+        guard isNearPossibleDockEdge(point) else {
             return Unmanaged.passUnretained(event)
         }
 
-        let point = event.location
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == ProcessInfo.processInfo.processIdentifier {
+            return Unmanaged.passUnretained(event)
+        }
 
         guard let resolution = resolveDockClick(at: point) else {
             return Unmanaged.passUnretained(event)
@@ -149,8 +173,40 @@ final class DockEventResolver {
         return false
     }
 
+    // CGEvent locations use a top-left origin; NSScreen frames use bottom-left.
+    // Fails open (returns true) when screen info is unavailable.
+    private func isNearPossibleDockEdge(_ point: CGPoint) -> Bool {
+        guard let mainFrame = cachedScreenFrames.first else {
+            return true
+        }
+
+        let cocoaPoint = NSPoint(x: point.x, y: mainFrame.maxY - point.y)
+        guard let frame = cachedScreenFrames.first(where: { NSMouseInRect(cocoaPoint, $0, false) }) else {
+            return true
+        }
+
+        // Generous margin covering the largest Dock size with magnification.
+        let margin: CGFloat = 160
+        let nearBottom = cocoaPoint.y - frame.minY <= margin
+        let nearLeft = cocoaPoint.x - frame.minX <= margin
+        let nearRight = frame.maxX - cocoaPoint.x <= margin
+        return nearBottom || nearLeft || nearRight
+    }
+
+    private func currentDockPID() -> pid_t? {
+        if cachedDockPID > 0,
+           let app = NSRunningApplication(processIdentifier: cachedDockPID),
+           !app.isTerminated,
+           app.bundleIdentifier == "com.apple.dock" {
+            return cachedDockPID
+        }
+
+        cachedDockPID = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier ?? -1
+        return cachedDockPID > 0 ? cachedDockPID : nil
+    }
+
     private func resolveDockClick(at point: CGPoint) -> DockClickResolution? {
-        guard let dockPID = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier else {
+        guard let dockPID = currentDockPID() else {
             return nil
         }
 
@@ -274,25 +330,19 @@ final class DockEventResolver {
     }
 
     private func extractBundleIdentifier(_ rawIdentifier: String) -> String? {
-        if rawIdentifier.contains(".") {
-            let parts = rawIdentifier.split(whereSeparator: { $0 == " " || $0 == ":" || $0 == "/" })
-            if let bundleLike = parts.first(where: { $0.contains(".") }) {
-                let candidate = String(bundleLike)
-                if candidate.hasPrefix("com.") || candidate.contains(".") {
-                    return candidate
-                }
-            }
+        let parts = rawIdentifier.split(whereSeparator: { $0 == " " || $0 == ":" || $0 == "/" })
+        if let bundleLike = parts.first(where: { $0.contains(".") }) {
+            return String(bundleLike)
         }
         return nil
     }
 
+    // Compare full names (whitespace-collapsed, lowercased). Matching only the
+    // first word could resolve e.g. "Adobe Photoshop" to a running "Adobe Acrobat".
     private func normalizedAppName(_ raw: String) -> String {
-        let stripped = raw
-            .replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(of: "\t", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let components = stripped.split(separator: " ")
-        return components.first.map { String($0).lowercased() } ?? ""
+        raw.split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+            .lowercased()
     }
 
     private func processIdentifier(of element: AXUIElement) -> pid_t {

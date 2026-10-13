@@ -5,6 +5,10 @@ struct SettingsView: View {
     @ObservedObject var appState: AppState
     @State private var selectedBundleIDToExclude: String = ""
 
+    // Keep permission status live while the window is open, so grants made in
+    // System Settings show up without pressing Refresh.
+    private let permissionTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+
     private var excludedBundleIDs: [String] {
         appState.preferences.excludedBundleIdentifiers.sorted()
     }
@@ -16,8 +20,28 @@ struct SettingsView: View {
         }
     }
 
+    private var appVersionString: String {
+        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+
+        guard let short else {
+            return "dev (running unbundled)"
+        }
+
+        if let build {
+            return "\(short) (build \(build))"
+        }
+        return short
+    }
+
     var body: some View {
         Form {
+            Section("About") {
+                LabeledContent("Version") {
+                    Text(appVersionString)
+                }
+            }
+
             Section("Permissions") {
                 LabeledContent("Accessibility") {
                     Text(appState.permissionStatus.accessibilityGranted ? "Granted" : "Missing")
@@ -161,6 +185,9 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .padding(16)
         .frame(width: 760, height: 680)
+        .onReceive(permissionTimer) { _ in
+            appState.refreshPermissionStatus()
+        }
     }
 
     private func nameForBundleID(_ bundleID: String) -> String {

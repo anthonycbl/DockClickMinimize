@@ -4,6 +4,8 @@ struct OnboardingView: View {
     @ObservedObject var appState: AppState
     let onContinue: () -> Void
 
+    private let permissionTimer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("DockClick Minimize")
@@ -35,6 +37,7 @@ struct OnboardingView: View {
                 }
 
                 Button("Grant Input Monitoring") {
+                    appState.requestInputMonitoringPermission()
                     appState.openInputMonitoringSettings()
                 }
 
@@ -56,5 +59,8 @@ struct OnboardingView: View {
         }
         .padding(20)
         .frame(width: 560)
+        .onReceive(permissionTimer) { _ in
+            appState.refreshPermissionStatus()
+        }
     }
 }

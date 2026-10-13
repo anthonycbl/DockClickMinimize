@@ -2,6 +2,12 @@ import AppKit
 import Combine
 import SwiftUI
 
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
+    }
+}
+
 @main
 struct DockClickMinimizeApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -29,6 +35,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private var suppressionWindows: Set<ObjectIdentifier> = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if let dumpIndex = CommandLine.arguments.firstIndex(of: "--dump-finder") {
+            let bundleID = CommandLine.arguments[safe: dumpIndex + 1] ?? "com.apple.finder"
+            WindowDiagnostics.runAndExit(bundleID: bundleID)
+        }
+
         NSApp.setActivationPolicy(.accessory)
 
         setupStatusItem()
@@ -60,7 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             let window = NSWindow(contentViewController: hosting)
             window.title = "DockClick Minimize Settings"
             window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-            window.setContentSize(NSSize(width: 760, height: 700))
+            window.setContentSize(NSSize(width: 760, height: 680))
             window.center()
             window.delegate = self
             settingsWindow = window
@@ -86,9 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = item.button {
-            button.title = "DockClick"
-            button.imagePosition = .imageLeading
-            button.image = NSImage(systemSymbolName: "rectangle.stack.badge.minus", accessibilityDescription: "DockClick")
+            button.image = NSImage(systemSymbolName: "rectangle.stack.badge.minus", accessibilityDescription: "DockClick Minimize")
         }
 
         let menu = NSMenu()

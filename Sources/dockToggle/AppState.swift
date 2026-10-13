@@ -73,6 +73,10 @@ final class AppState: ObservableObject {
         permissionManager.openAccessibilitySettings()
     }
 
+    func requestInputMonitoringPermission() {
+        permissionManager.requestInputMonitoringPrompt()
+    }
+
     func openInputMonitoringSettings() {
         permissionManager.openInputMonitoringSettings()
     }
